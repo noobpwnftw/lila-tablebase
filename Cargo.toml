@@ -13,15 +13,14 @@ keywords = ["chess", "syzygy", "tablebase"]
 edition = "2021"
 
 [dependencies]
-axum = "0.6"
+axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
-shakmaty = "0.25"
-shakmaty-syzygy = { version = "0.23", features = ["variant"] }
-gaviota-sys = "0.1"
+shakmaty = "0.30"
+shakmaty-syzygy = { version = "0.28", features = ["variant"] }
 arrayvec = { version = "0.7", features = ["serde"] }
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 serde_with = "3"
-moka = { version = "0.11", features = ["future"] }
+moka = { version = "0.12", features = ["future"] }

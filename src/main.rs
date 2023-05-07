@@ -2,10 +2,8 @@
 
 use std::{
     cmp::{Ordering, Reverse},
-    ffi::CString,
     net::SocketAddr,
     ops::Neg,
-    os::raw::{c_int, c_uchar, c_uint},
     path::PathBuf,
     sync::{atomic, atomic::AtomicU64, Arc},
     time::Duration,
@@ -27,9 +25,9 @@ use serde_with::{serde_as, DisplayFromStr, FromInto};
 use shakmaty::{
     fen::{Fen, ParseFenError},
     san::SanPlus,
-    uci::Uci,
+    uci::UciMove,
     variant::{Antichess, Atomic, Chess, Variant, VariantPosition},
-    CastlingMode, EnPassantMode, Move, Outcome, Position, PositionError, Role,
+    CastlingMode, Move, Outcome, KnownOutcome, Position, PositionError, Role,
 };
 use shakmaty_syzygy::{AmbiguousWdl, Dtz, MaybeRounded, SyzygyError, Tablebase as SyzygyTablebase};
 use tokio::{sync::Semaphore, task};
@@ -74,7 +72,7 @@ struct TablebaseResponse {
 #[derive(Serialize, Debug, Clone)]
 struct MoveInfo {
     #[serde_as(as = "DisplayFromStr")]
-    uci: Uci,
+    uci: UciMove,
     #[serde_as(as = "DisplayFromStr")]
     san: SanPlus,
     zeroing: bool,
@@ -102,7 +100,6 @@ struct PositionInfo {
     precise_dtz: Option<Dtz>,
     #[serde(skip)]
     dtz: Option<MaybeRounded<Dtz>>,
-    dtm: Option<i32>,
     #[serde(skip)]
     halfmoves: u32,
 }
@@ -210,87 +207,13 @@ struct MainlineResponse {
 #[derive(Serialize, Debug)]
 struct MainlineStep {
     #[serde_as(as = "DisplayFromStr")]
-    uci: Uci,
+    uci: UciMove,
     #[serde_as(as = "DisplayFromStr")]
     san: SanPlus,
     #[serde_as(as = "FromInto<i32>")]
     dtz: Dtz,
     #[serde_as(as = "Option<FromInto<i32>>")]
     precise_dtz: Option<Dtz>,
-}
-
-unsafe fn probe_dtm(pos: &VariantPosition) -> Option<i32> {
-    let pos = match *pos {
-        VariantPosition::Chess(ref pos) => pos,
-        _ => return None,
-    };
-
-    if pos.board().occupied().count() > 5 || pos.castles().any() {
-        return None;
-    }
-
-    if unsafe { gaviota_sys::tb_is_initialized() } == 0 {
-        return None;
-    }
-
-    let mut ws = ArrayVec::<c_uint, 6>::new();
-    let mut bs = ArrayVec::<c_uint, 6>::new();
-    let mut wp = ArrayVec::<c_uchar, 6>::new();
-    let mut bp = ArrayVec::<c_uchar, 6>::new();
-
-    for (sq, piece) in pos.board().clone() {
-        piece.color.fold_wb(&mut ws, &mut bs).push(c_uint::from(sq));
-        piece
-            .color
-            .fold_wb(&mut wp, &mut bp)
-            .push(c_uchar::from(piece.role));
-    }
-
-    ws.push(gaviota_sys::TB_squares::tb_NOSQUARE as c_uint);
-    bs.push(gaviota_sys::TB_squares::tb_NOSQUARE as c_uint);
-    wp.push(gaviota_sys::TB_pieces::tb_NOPIECE as c_uchar);
-    bp.push(gaviota_sys::TB_pieces::tb_NOPIECE as c_uchar);
-
-    let mut info: c_uint = 0;
-    let mut plies: c_uint = 0;
-
-    let result = unsafe {
-        gaviota_sys::tb_probe_hard(
-            pos.turn().fold_wb(
-                gaviota_sys::TB_sides::tb_WHITE_TO_MOVE,
-                gaviota_sys::TB_sides::tb_BLACK_TO_MOVE,
-            ) as c_uint,
-            pos.ep_square(EnPassantMode::Legal)
-                .map_or(gaviota_sys::TB_squares::tb_NOSQUARE as c_uint, c_uint::from),
-            gaviota_sys::TB_castling::tb_NOCASTLE.0,
-            ws.as_ptr(),
-            bs.as_ptr(),
-            wp.as_ptr(),
-            bp.as_ptr(),
-            &mut info as *mut c_uint,
-            &mut plies as *mut c_uint,
-        )
-    };
-
-    let plies = plies as i32;
-
-    match gaviota_sys::TB_return_values(info) {
-        gaviota_sys::TB_return_values::tb_DRAW if result != 0 => Some(0),
-        gaviota_sys::TB_return_values::tb_WMATE if result != 0 => {
-            Some(pos.turn().fold_wb(plies, -plies))
-        }
-        gaviota_sys::TB_return_values::tb_BMATE if result != 0 => {
-            Some(pos.turn().fold_wb(-plies, plies))
-        }
-        gaviota_sys::TB_return_values::tb_FORBID => None,
-        _ => {
-            warn!(
-                "gaviota probe failed with result {} and info {}",
-                result, info
-            );
-            None
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -324,21 +247,20 @@ impl Tablebases {
 
     fn position_info(&self, pos: &VariantPosition) -> Result<PositionInfo, SyzygyError> {
         let (variant_win, variant_loss) = match pos.variant_outcome() {
-            Some(Outcome::Decisive { winner }) => (winner == pos.turn(), winner != pos.turn()),
+            Outcome::Known(KnownOutcome::Decisive { winner }) => (winner == pos.turn(), winner != pos.turn()),
             _ => (false, false),
         };
 
-        fn user_error_as_none<T>(res: Result<T, SyzygyError>) -> Result<Option<T>, SyzygyError> {
-            match res {
-                Err(SyzygyError::Castling)
-                | Err(SyzygyError::TooManyPieces)
-                | Err(SyzygyError::MissingTable { .. }) => Ok(None), // user error
-                Err(err) => Err(err), // server error
-                Ok(res) => Ok(Some(res)),
-            }
-        }
 
-        let dtz = user_error_as_none(self.probe_dtz(pos))?;
+        let dtz = match self.probe_dtz(pos) {
+            Err(
+                SyzygyError::Castling
+                | SyzygyError::TooManyPieces
+                | SyzygyError::MissingTable { .. },
+            ) => None, // user error
+            Err(err) => return Err(err), // server error
+            Ok(res) => Some(res),
+        };
 
         Ok(PositionInfo {
             checkmate: pos.is_checkmate(),
@@ -349,7 +271,6 @@ impl Tablebases {
             maybe_rounded_dtz: dtz.map(MaybeRounded::ignore_rounding),
             precise_dtz: dtz.and_then(MaybeRounded::precise),
             dtz,
-            dtm: unsafe { probe_dtm(pos) },
             halfmoves: pos.halfmoves(),
         })
     }
@@ -362,13 +283,13 @@ impl Tablebases {
             .iter()
             .map(|m| {
                 let mut after = pos.clone();
-                after.play_unchecked(m);
+                after.play_unchecked(*m);
 
                 let after_info = self.position_info(&after)?;
 
                 Ok(MoveInfo {
                     uci: m.to_uci(pos.castles().mode()),
-                    san: SanPlus::from_move(pos.clone(), m),
+                    san: SanPlus::from_move(pos.clone(), *m),
                     capture: m.capture(),
                     promotion: m.promotion(),
                     zeroing: m.is_zeroing(),
@@ -390,34 +311,16 @@ impl Tablebases {
                     Reverse(m.pos.stalemate),
                     Reverse(m.pos.insufficient_material),
                 ),
-                if m.pos
-                    .dtz
-                    .unwrap_or(MaybeRounded::Precise(Dtz(0)))
-                    .is_negative()
-                {
-                    Reverse(m.pos.dtm)
-                } else {
-                    Reverse(None)
-                },
-                if m.pos
-                    .dtz
-                    .unwrap_or(MaybeRounded::Precise(Dtz(0)))
-                    .is_positive()
-                {
-                    m.pos.dtm.map(Reverse)
-                } else {
-                    None
-                },
                 m.zeroing
-                    ^ !m.pos
+                    ^ m.pos
                         .dtz
                         .unwrap_or(MaybeRounded::Precise(Dtz(0)))
-                        .is_positive(),
+                        .is_negative(),
                 m.capture.is_some()
-                    ^ !m.pos
+                    ^ m.pos
                         .dtz
                         .unwrap_or(MaybeRounded::Precise(Dtz(0)))
-                        .is_positive(),
+                        .is_negative(),
                 m.pos.maybe_rounded_dtz.map(Reverse),
                 (Reverse(m.capture), Reverse(m.promotion)),
             )
@@ -454,7 +357,7 @@ impl Tablebases {
 
         Ok(TablebaseResponse {
             pos: pos_info,
-            category: move_info.first().map(|m| -m.category).unwrap_or(category),
+            category: category,
             moves: move_info,
         })
     }
@@ -470,7 +373,7 @@ impl Tablebases {
                         uci: m.to_uci(pos.castles().mode()),
                         dtz: dtz.ignore_rounding(),
                         precise_dtz: dtz.precise(),
-                        san: SanPlus::from_move_and_play_unchecked(&mut pos, &m),
+                        san: SanPlus::from_move_and_play_unchecked(&mut pos, m),
                     });
                 } else {
                     break;
@@ -484,7 +387,7 @@ impl Tablebases {
             mainline,
             winner: pos
                 .outcome()
-                .and_then(|o| o.winner())
+                .winner()
                 .map(|winner| winner.char()),
         })
     }
@@ -584,9 +487,6 @@ struct Opt {
     /// Directory with tablebase files for antichess.
     #[arg(long, action = ArgAction::Append, value_parser = PathBufValueParser::new())]
     antichess: Vec<PathBuf>,
-    /// Directory with Gaviota tablebase files.
-    #[arg(long, action = ArgAction::Append, value_parser = PathBufValueParser::new())]
-    gaviota: Vec<PathBuf>,
 
     /// Maximum number of cached responses.
     #[arg(long, default_value = "20000")]
@@ -623,32 +523,10 @@ async fn serve() {
     if opt.standard.is_empty()
         && opt.atomic.is_empty()
         && opt.antichess.is_empty()
-        && opt.gaviota.is_empty()
     {
         Opt::command().print_help().expect("usage");
         println!();
         return;
-    }
-
-    // Initialize Gaviota tablebase.
-    if !opt.gaviota.is_empty() {
-        unsafe {
-            assert!(gaviota_sys::tbcache_init(1014 * 1024, 50) != 0);
-            let mut paths = gaviota_sys::tbpaths_init();
-            assert!(!paths.is_null());
-            for path in opt.gaviota {
-                let path = CString::new(path.as_os_str().to_str().unwrap()).unwrap();
-                paths = gaviota_sys::tbpaths_add(paths, path.as_ptr());
-                assert!(!paths.is_null());
-                drop(path);
-            }
-            assert!(!gaviota_sys::tb_init(
-                1,
-                gaviota_sys::TB_compression_scheme::tb_CP4 as c_int,
-                paths
-            )
-            .is_null());
-        }
     }
 
     // Initialize Syzygy tablebases.
@@ -688,14 +566,12 @@ async fn serve() {
 
     let app = Router::new()
         .route("/monitor", get(handle_monitor))
-        .route("/:variant", get(handle_probe))
-        .route("/:variant/mainline", get(handle_mainline))
+        .route("/{variant}", get(handle_probe))
+        .route("/{variant}/mainline", get(handle_mainline))
         .with_state(state);
 
-    axum::Server::bind(&opt.bind)
-        .serve(app.into_make_service())
-        .await
-        .expect("bind");
+    let listener = tokio::net::TcpListener::bind(&opt.bind).await.expect("bind");
+    axum::serve(listener, app).await.expect("serve");
 }
 
 async fn handle_monitor(State(app): State<&'static AppState>) -> String {
