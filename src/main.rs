@@ -409,15 +409,15 @@ impl Tablebases {
                     None
                 },
                 m.zeroing
-                    ^ !m.pos
+                    ^ m.pos
                         .dtz
                         .unwrap_or(MaybeRounded::Precise(Dtz(0)))
-                        .is_positive(),
+                        .is_negative(),
                 m.capture.is_some()
-                    ^ !m.pos
+                    ^ m.pos
                         .dtz
                         .unwrap_or(MaybeRounded::Precise(Dtz(0)))
-                        .is_positive(),
+                        .is_negative(),
                 m.pos.maybe_rounded_dtz.map(Reverse),
                 (Reverse(m.capture), Reverse(m.promotion)),
             )
@@ -454,7 +454,7 @@ impl Tablebases {
 
         Ok(TablebaseResponse {
             pos: pos_info,
-            category: move_info.first().map(|m| -m.category).unwrap_or(category),
+            category: category,
             moves: move_info,
         })
     }
@@ -692,10 +692,8 @@ async fn serve() {
         .route("/:variant/mainline", get(handle_mainline))
         .with_state(state);
 
-    axum::Server::bind(&opt.bind)
-        .serve(app.into_make_service())
-        .await
-        .expect("bind");
+    let listener = tokio::net::TcpListener::bind(&opt.bind).await.expect("bind");
+    axum::serve(listener, app).await.expect("serve");
 }
 
 async fn handle_monitor(State(app): State<&'static AppState>) -> String {
